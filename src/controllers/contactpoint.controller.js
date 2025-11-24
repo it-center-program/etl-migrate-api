@@ -58,7 +58,7 @@ export async function runETL(req, res) {
     `);
     const batchNo = batchRes.rows[0].batch_no;
 
-    const raw = await fetchContact(lastId, 1000);
+    const raw = await fetchContact(lastId, 5000);
     const data = raw.data;
 
     const recordCount = data.length;
