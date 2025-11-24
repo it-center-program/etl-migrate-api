@@ -1,21 +1,23 @@
+import "dotenv/config";
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
 import pool from "./db.js";
+import contactPointRoutes from "./routes/contactpoint.route.js";
 
-dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+const API_URL = process.env.API_URL;
 const port = process.env.PORT || 3000;
 
 app.get("/", async (req, res) => {
   try {
     const lastId = await getLastId();
     const apiUrl = lastId
-      ? `http://10.0.0.115:8001/api/po?lastId=${lastId}`
-      : `http://10.0.0.115:8001/api/po`;
+      ? `${API_URL}/api/po?lastId=${lastId}`
+      : `${API_URL}/api/po`;
     res.json({
       message: "Hello success",
       apiUrl,
@@ -45,11 +47,15 @@ async function saveLog({ lastId, recordCount, status, errorMessage }) {
 // API สำหรับ cronjob เรียกทำ migration
 app.get("/api/migrate", async (req, res) => {
   let client;
+  return res.status(400).json({
+    message: "Disable Route",
+    count: 0,
+  });
   try {
     const lastId = await getLastId();
     const apiUrl = lastId
-      ? `http://10.0.0.115:8001/api/po?lastId=${lastId}`
-      : `http://10.0.0.115:8001/api/po`;
+      ? `${API_URL}/api/po?lastId=${lastId}`
+      : `${API_URL}/api/po`;
 
     console.log(`Fetching: ${apiUrl}`);
     const response = await fetch(apiUrl);
@@ -188,6 +194,8 @@ app.get("/api/migrate", async (req, res) => {
     if (client) client.release();
   }
 });
+
+app.use("/api/contactpoint", contactPointRoutes);
 
 app.listen(port, () => {
   console.log(`✅ Server running at http://localhost:${port}`);
