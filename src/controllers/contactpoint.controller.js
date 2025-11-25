@@ -1,6 +1,9 @@
 import pool from "../db.js";
 import { fetchContact } from "../services/fetchContact.js";
-import { saveToPostgres } from "../services/saveToPostgres.js";
+import {
+  saveToPostgres,
+  saveToPostgresBulk,
+} from "../services/saveToPostgres.js";
 
 async function getLastId() {
   const res = await pool.query(
@@ -44,31 +47,55 @@ async function saveLogFinish({
 }
 
 export async function runETL(req, res) {
+  const limit = parseInt(req.query.limit) || 1000;
   const startTime = Date.now();
   let client;
   let logId;
   let lastId;
-  try {
-    lastId = await getLastId();
 
+  const stepDurations = {}; // เก็บเวลาแต่ละขั้นตอน
+
+  try {
+    // STEP 1: Get last ID
+    let t0 = Date.now();
+    lastId = await getLastId();
+    stepDurations.getLastId = Date.now() - t0;
+    console.log("getLastId", stepDurations.getLastId);
+
+    // STEP 2: Get next batch number
+    t0 = Date.now();
     const batchRes = await pool.query(`
       SELECT COALESCE(MAX(batch_no), 0) + 1 AS batch_no
       FROM migrate_log_customer
       WHERE DATE(started_at) = CURRENT_DATE
     `);
     const batchNo = batchRes.rows[0].batch_no;
+    stepDurations.getBatchNo = Date.now() - t0;
+    console.log("getBatchNo", stepDurations.getBatchNo);
 
-    const raw = await fetchContact(lastId, 5000);
+    // STEP 3: Fetch contact data
+    t0 = Date.now();
+    const raw = await fetchContact(lastId, limit);
     const data = raw.data;
-
     const recordCount = data.length;
+    stepDurations.fetchData = Date.now() - t0;
+    console.log("fetchData", stepDurations.fetchData);
 
+    // STEP 4: Save log start
+    t0 = Date.now();
     logId = await saveLogStart({ continueId: lastId, batchNo });
+    stepDurations.saveLogStart = Date.now() - t0;
+    console.log("saveLogStart", stepDurations.saveLogStart);
 
+    // STEP 5: Begin transaction
+    t0 = Date.now();
     client = await pool.connect();
     await client.query("BEGIN");
+    stepDurations.beginTransaction = Date.now() - t0;
+    console.log("beginTransaction", stepDurations.beginTransaction);
 
     if (recordCount === 0) {
+      t0 = Date.now();
       await saveLogFinish({
         logId,
         newLastId: lastId,
@@ -76,19 +103,37 @@ export async function runETL(req, res) {
         status: "success",
         errorMessage: null,
       });
+      stepDurations.saveLogFinish = Date.now() - t0;
+      console.log("saveLogFinish", stepDurations.saveLogFinish);
 
       await client.query("COMMIT");
-      return res.json({ message: "All data synced", count: 0 });
+      stepDurations.commit = 0;
+      return res.json({
+        message: "All data synced",
+        count: 0,
+        durations: stepDurations,
+      });
     }
 
-    await client.query(`DELETE FROM etl_customer_crm WHERE id > $1`, [lastId]);
-    // return res.json({ status: "ok", data });
-    const save = await saveToPostgres(data, logId);
+    // STEP 6: Delete old records
+    t0 = Date.now();
+    await client.query(
+      `DELETE FROM etl_customer_crm WHERE recid > $1 AND rectype='BIGDATA'`,
+      [lastId]
+    );
+    stepDurations.deleteOldRecords = Date.now() - t0;
+    console.log("deleteOldRecords", stepDurations.deleteOldRecords);
 
-    const newLastId = data[recordCount - 1].id; // สมมติ API ส่ง id เรียงลำดับ
+    // STEP 7: Save to Postgres
+    t0 = Date.now();
+    const save = await saveToPostgresBulk(data);
+    // const save = await saveToPostgres(data, logId);
+    stepDurations.saveToPostgres = Date.now() - t0;
+    console.log("saveToPostgres", stepDurations.saveToPostgres);
 
-    // const newLastId = data[data.length - 1].RECID2;
-
+    // STEP 8: Finish log
+    t0 = Date.now();
+    const newLastId = data[recordCount - 1].id;
     await saveLogFinish({
       logId,
       newLastId,
@@ -98,16 +143,24 @@ export async function runETL(req, res) {
       status: "success",
       errorMessage: null,
     });
+    stepDurations.saveLogFinish = Date.now() - t0;
+    console.log("saveLogFinish", stepDurations.saveLogFinish);
 
+    // STEP 9: Commit transaction
+    t0 = Date.now();
     await client.query("COMMIT");
-    const duration = Date.now() - startTime;
-    // res.json({ status: "ok", lastId, data });
+    stepDurations.commit = Date.now() - t0;
+    console.log("commit", stepDurations.commit);
+
+    const totalDuration = Date.now() - startTime;
+
     res.json({
       message: "Batch completed",
       batch_no: batchNo,
       count: recordCount,
       lastId: newLastId,
-      duration_ms: duration,
+      totalDuration_ms: totalDuration,
+      stepDurations,
     });
   } catch (err) {
     if (client) await client.query("ROLLBACK");
@@ -120,6 +173,7 @@ export async function runETL(req, res) {
       errorMessage: err.message,
     });
     console.error(err);
+
     res.status(500).json({ status: "error", message: err.message });
   }
 }
