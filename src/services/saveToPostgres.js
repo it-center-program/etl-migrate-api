@@ -144,19 +144,20 @@ export async function saveToPostgresBulk(rows) {
   const existingHNs = await redis.sMembers("etl:hn_codes");
   const existsMap = new Set(existingHNs);
 
-  const tempHNs = new Set();
+  const tempHNs = new Set(); // HN ที่เป็น "new" ในรอบนี้ (first-seen -> insert)
 
   // -------------------------
-  // 1) collect HN ที่ต้อง update
+  // 1) collect unique HN ที่ต้อง update (only those present in Redis initially)
   // -------------------------
-  const updateHNList = [];
+  const updateHNSet = new Set();
   for (const row of rows) {
     const hn = row.hn_code;
-    if (existsMap.has(hn)) updateHNList.push(hn);
+    if (existsMap.has(hn)) updateHNSet.add(hn);
   }
+  const updateHNList = Array.from(updateHNSet);
 
   // -------------------------
-  // 2) preload old phones (Pipeline ครั้งเดียว)
+  // 2) preload old phones (Pipeline ครั้งเดียว) -> phoneData
   // -------------------------
   const phoneData = {};
   if (updateHNList.length) {
@@ -168,13 +169,16 @@ export async function saveToPostgresBulk(rows) {
 
     result.forEach((res, idx) => {
       const hn = updateHNList[idx];
-      phoneData[hn] = res[1] || {};
+      phoneData[hn] = res[1] || {}; // redis response: [err, value]
     });
   }
 
   // -------------------------
-  // 3) loop ไม่ await Redis แล้ว
+  // currentPhones จะเก็บสถานะล่าสุดสำหรับแต่ละ HN ใน batch นี้
+  // เริ่มจาก phoneData (HN ที่มีใน Redis) — HN ใหม่จะถูกเพิ่มเมื่อเจอครั้งแรก
   // -------------------------
+  const currentPhones = new Map(Object.entries(phoneData)); // hn -> oldPhones object
+
   const inserts = [];
   const updates = [];
   const redisHSetOps = [];
@@ -183,15 +187,37 @@ export async function saveToPostgresBulk(rows) {
     const hn = row.hn_code;
     const phones = extractPhones(row.tel_no);
 
-    const exists = existsMap.has(hn) || tempHNs.has(hn);
-    const oldPhones = exists ? phoneData[hn] : null;
+    const existsInRedis = existsMap.has(hn);
+    const seenAsNew = tempHNs.has(hn);
 
-    const merged = mergePhones(oldPhones, phones);
-
-    if (!exists) {
-      inserts.push({ row, merged });
-      tempHNs.add(hn);
+    // oldPhones logic:
+    // - ถ้า hn มีใน redis ตั้งแต่ต้น -> ใช้ currentPhones[hn] (preloaded or updated)
+    // - ถ้า hn เป็น new ที่เจอในรอบนี้แล้ว (seenAsNew) -> ใช้ currentPhones[hn] (merged จาก first-seen)
+    // - ถ้า hn ใหม่และยังไม่เคยเจอในรอบนี้ -> oldPhones = null
+    let oldPhones = null;
+    if (existsInRedis) {
+      oldPhones = currentPhones.get(hn) || null;
+    } else if (seenAsNew) {
+      oldPhones = currentPhones.get(hn) || null;
     } else {
+      oldPhones = null;
+    }
+    // merge ใช้ฟังก์ชันที่คุณมี (ปรับให้ถูกต้องตามก่อนหน้า)
+    const merged = mergePhones(oldPhones, phones);
+    // console.log("---------------------------");
+    // console.log(hn, merged);
+    // console.log("---------------------------");
+
+    // หลัง merge ให้อัปเดต currentPhones เสมอ เพื่อให้ subsequent rows ใช้ค่าอัปเดตล่าสุด
+    currentPhones.set(hn, merged);
+
+    // ตัดสิน insert / update:
+    if (!existsInRedis && !seenAsNew) {
+      // first time seen in this batch and not in redis => insert
+      inserts.push({ row, merged });
+      tempHNs.add(hn); // mark as seen new
+    } else {
+      // either existed in redis originally OR we've already seen it in this batch
       updates.push({ row, merged });
     }
 
@@ -199,7 +225,7 @@ export async function saveToPostgresBulk(rows) {
   }
 
   // -------------------------
-  // 4) bulk insert/update
+  // 4) bulk insert/update (simulated here with redis.sAdd for test)
   // -------------------------
   if (inserts.length) {
     await bulkInsertPostgres(inserts);
@@ -214,7 +240,7 @@ export async function saveToPostgresBulk(rows) {
   }
 
   // -------------------------
-  // 5) pipeline แบ่ง batch 1000
+  // 5) write to redis in batches
   // -------------------------
   const batchSize = 1000;
   for (let i = 0; i < redisHSetOps.length; i += batchSize) {
@@ -366,60 +392,119 @@ export async function bulkUpdatePostgres(rows) {
 }
 
 export async function saveToPostgresBulkTest(rows) {
+  // preload all existed HN from Redis
+  const existingHNs = await redis.sMembers("etl:hn_codes");
+  const existsMap = new Set(existingHNs);
+
+  const tempHNs = new Set(); // HN ที่เป็น "new" ในรอบนี้ (first-seen -> insert)
+
+  // -------------------------
+  // 1) collect unique HN ที่ต้อง update (only those present in Redis initially)
+  // -------------------------
+  const updateHNSet = new Set();
+  for (const row of rows) {
+    const hn = row.hn_code;
+    if (existsMap.has(hn)) updateHNSet.add(hn);
+  }
+  const updateHNList = Array.from(updateHNSet);
+
+  // -------------------------
+  // 2) preload old phones (Pipeline ครั้งเดียว) -> phoneData
+  // -------------------------
+  const phoneData = {};
+  if (updateHNList.length) {
+    const pipe = redis.multi();
+    for (const hn of updateHNList) {
+      pipe.hGetAll(`etl:phones:${hn}`);
+    }
+    const result = await pipe.exec();
+
+    result.forEach((res, idx) => {
+      const hn = updateHNList[idx];
+      phoneData[hn] = res[1] || {}; // redis response: [err, value]
+    });
+  }
+
+  // -------------------------
+  // currentPhones จะเก็บสถานะล่าสุดสำหรับแต่ละ HN ใน batch นี้
+  // เริ่มจาก phoneData (HN ที่มีใน Redis) — HN ใหม่จะถูกเพิ่มเมื่อเจอครั้งแรก
+  // -------------------------
+  const currentPhones = new Map(Object.entries(phoneData)); // hn -> oldPhones object
+
   const inserts = [];
   const updates = [];
   const redisHSetOps = [];
 
-  const seenHN = new Set();
-
   for (const row of rows) {
     const hn = row.hn_code;
-    const newPhones = extractPhones(row.tel_no);
+    const phones = extractPhones(row.tel_no);
 
-    let exists = false;
-    // const exists = await redis.sIsMember("etl:hn_codes", hn);
+    const existsInRedis = existsMap.has(hn);
+    const seenAsNew = tempHNs.has(hn);
 
-    // ---------- เช็คจาก temp ก่อน ----------
-    if (seenHN.has(hn)) {
-      exists = true;
+    // oldPhones logic:
+    // - ถ้า hn มีใน redis ตั้งแต่ต้น -> ใช้ currentPhones[hn] (preloaded or updated)
+    // - ถ้า hn เป็น new ที่เจอในรอบนี้แล้ว (seenAsNew) -> ใช้ currentPhones[hn] (merged จาก first-seen)
+    // - ถ้า hn ใหม่และยังไม่เคยเจอในรอบนี้ -> oldPhones = null
+    let oldPhones = null;
+    if (existsInRedis) {
+      oldPhones = currentPhones.get(hn) || null;
+    } else if (seenAsNew) {
+      oldPhones = currentPhones.get(hn) || null;
     } else {
-      // ---------- เช็คจาก Redis ----------
-      exists = await redis.sIsMember("etl:hn_codes", hn);
-      if (exists) seenHN.add(hn);
+      oldPhones = null;
     }
+    // merge ใช้ฟังก์ชันที่คุณมี (ปรับให้ถูกต้องตามก่อนหน้า)
+    const merged = mergePhones(oldPhones, phones);
+    console.log("---------------------------");
+    console.log(hn, merged);
+    console.log("---------------------------");
 
-    const merged = exists
-      ? mergePhones(await redis.hGetAll(`etl:phones:${hn}`), newPhones)
-      : mergePhones(null, newPhones);
+    // หลัง merge ให้อัปเดต currentPhones เสมอ เพื่อให้ subsequent rows ใช้ค่าอัปเดตล่าสุด
+    currentPhones.set(hn, merged);
 
-    if (!exists) {
+    // ตัดสิน insert / update:
+    if (!existsInRedis && !seenAsNew) {
+      // first time seen in this batch and not in redis => insert
       inserts.push({ row, merged });
-      seenHN.add(hn); // สำคัญมาก! ป้องกัน insert ซ้ำภายใน batch
+      tempHNs.add(hn); // mark as seen new
     } else {
+      // either existed in redis originally OR we've already seen it in this batch
       updates.push({ row, merged });
     }
 
     redisHSetOps.push({ key: `etl:phones:${hn}`, value: merged });
   }
 
-  // ---------- Bulk INSERT ----------
+  // -------------------------
+  // 4) bulk insert/update (simulated here with redis.sAdd for test)
+  // -------------------------
   if (inserts.length) {
     // await bulkInsertPostgres(inserts);
-    const hnToAdd = inserts.map(({ row }) => row.hn_code);
-    await redis.sAdd("etl:hn_codes", hnToAdd);
+    await redis.sAdd(
+      "etl:hn_codes",
+      inserts.map((i) => i.row.hn_code)
+    );
   }
 
-  // ---------- Bulk UPDATE ----------
   if (updates.length) {
     // await bulkUpdatePostgres(updates);
   }
 
-  // ---------- Redis Pipeline ----------
-  const pipeline = redis.multi();
-  for (const { key, value } of redisHSetOps) {
-    pipeline.hSet(key, objectToHSet(value));
+  // -------------------------
+  // 5) write to redis in batches
+  // -------------------------
+  const batchSize = 1000;
+  for (let i = 0; i < redisHSetOps.length; i += batchSize) {
+    const pipe = redis.multi();
+    for (const { key, value } of redisHSetOps.slice(i, i + batchSize)) {
+      pipe.hSet(key, objectToHSet(value));
+    }
+    await pipe.exec();
   }
-  await pipeline.exec();
 
-  return { insertCount: inserts.length, updateCount: updates.length };
+  return {
+    insertCount: inserts.length,
+    updateCount: updates.length,
+  };
 }
