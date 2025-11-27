@@ -204,9 +204,11 @@ export async function saveToPostgresBulk(rows) {
     }
     // merge ใช้ฟังก์ชันที่คุณมี (ปรับให้ถูกต้องตามก่อนหน้า)
     const merged = mergePhones(oldPhones, phones);
-    // console.log("---------------------------");
-    // console.log(hn, merged);
-    // console.log("---------------------------");
+    if (hn == "N073935") {
+      console.log("---------------------------");
+      console.log(hn, merged);
+      console.log("---------------------------");
+    }
 
     // หลัง merge ให้อัปเดต currentPhones เสมอ เพื่อให้ subsequent rows ใช้ค่าอัปเดตล่าสุด
     currentPhones.set(hn, merged);

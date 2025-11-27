@@ -57,7 +57,7 @@ export async function runETL(req, res) {
   try {
     // STEP 1: Get last ID
     let t0 = Date.now();
-    lastId = await getLastId();
+    lastId = parseInt(req.query.lastId) || (await getLastId());
     stepDurations.getLastId = Date.now() - t0;
 
     // STEP 2: batchNo ...
