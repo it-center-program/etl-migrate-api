@@ -1,6 +1,7 @@
 import { Router } from "express";
-import { runETL } from "../controllers/contactpoint.controller.js";
+import { runETL, testETL } from "../controllers/contactpoint.controller.js";
 import { preloadRedisFromPostgres } from "../services/preloadRedis.js";
+import { redis } from "../database/redisClient.js";
 
 const router = Router();
 
@@ -18,5 +19,7 @@ router.get("/refresh-redis", async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+
+router.get("/test-etl", testETL);
 
 export default router;

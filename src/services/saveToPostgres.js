@@ -140,21 +140,57 @@ function objectToHSet(obj) {
 }
 
 export async function saveToPostgresBulk(rows) {
+  // preload all existed HN from Redis
+  const existingHNs = await redis.sMembers("etl:hn_codes");
+  const existsMap = new Set(existingHNs);
+
+  const tempHNs = new Set();
+
+  // -------------------------
+  // 1) collect HN ที่ต้อง update
+  // -------------------------
+  const updateHNList = [];
+  for (const row of rows) {
+    const hn = row.hn_code;
+    if (existsMap.has(hn)) updateHNList.push(hn);
+  }
+
+  // -------------------------
+  // 2) preload old phones (Pipeline ครั้งเดียว)
+  // -------------------------
+  const phoneData = {};
+  if (updateHNList.length) {
+    const pipe = redis.multi();
+    for (const hn of updateHNList) {
+      pipe.hGetAll(`etl:phones:${hn}`);
+    }
+    const result = await pipe.exec();
+
+    result.forEach((res, idx) => {
+      const hn = updateHNList[idx];
+      phoneData[hn] = res[1] || {};
+    });
+  }
+
+  // -------------------------
+  // 3) loop ไม่ await Redis แล้ว
+  // -------------------------
   const inserts = [];
   const updates = [];
   const redisHSetOps = [];
 
   for (const row of rows) {
     const hn = row.hn_code;
-    const newPhones = extractPhones(row.tel_no);
-    const exists = await redis.sIsMember("etl:hn_codes", hn);
+    const phones = extractPhones(row.tel_no);
 
-    const merged = exists
-      ? mergePhones(await redis.hGetAll(`etl:phones:${hn}`), newPhones)
-      : mergePhones(null, newPhones);
+    const exists = existsMap.has(hn) || tempHNs.has(hn);
+    const oldPhones = exists ? phoneData[hn] : null;
+
+    const merged = mergePhones(oldPhones, phones);
 
     if (!exists) {
       inserts.push({ row, merged });
+      tempHNs.add(hn);
     } else {
       updates.push({ row, merged });
     }
@@ -162,26 +198,37 @@ export async function saveToPostgresBulk(rows) {
     redisHSetOps.push({ key: `etl:phones:${hn}`, value: merged });
   }
 
-  // ---------- Bulk INSERT ----------
+  // -------------------------
+  // 4) bulk insert/update
+  // -------------------------
   if (inserts.length) {
     await bulkInsertPostgres(inserts);
-    const hnToAdd = inserts.map(({ row }) => row.hn_code);
-    await redis.sAdd("etl:hn_codes", hnToAdd);
+    await redis.sAdd(
+      "etl:hn_codes",
+      inserts.map((i) => i.row.hn_code)
+    );
   }
 
-  // ---------- Bulk UPDATE ----------
   if (updates.length) {
     await bulkUpdatePostgres(updates);
   }
 
-  // ---------- Redis Pipeline ----------
-  const pipeline = redis.multi();
-  for (const { key, value } of redisHSetOps) {
-    pipeline.hSet(key, objectToHSet(value));
+  // -------------------------
+  // 5) pipeline แบ่ง batch 1000
+  // -------------------------
+  const batchSize = 1000;
+  for (let i = 0; i < redisHSetOps.length; i += batchSize) {
+    const pipe = redis.multi();
+    for (const { key, value } of redisHSetOps.slice(i, i + batchSize)) {
+      pipe.hSet(key, objectToHSet(value));
+    }
+    await pipe.exec();
   }
-  await pipeline.exec();
 
-  return { insertCount: inserts.length, updateCount: updates.length };
+  return {
+    insertCount: inserts.length,
+    updateCount: updates.length,
+  };
 }
 
 const COLUMNS = [
@@ -316,4 +363,63 @@ export async function bulkUpdatePostgres(rows) {
 
     await Promise.all(promises);
   }
+}
+
+export async function saveToPostgresBulkTest(rows) {
+  const inserts = [];
+  const updates = [];
+  const redisHSetOps = [];
+
+  const seenHN = new Set();
+
+  for (const row of rows) {
+    const hn = row.hn_code;
+    const newPhones = extractPhones(row.tel_no);
+
+    let exists = false;
+    // const exists = await redis.sIsMember("etl:hn_codes", hn);
+
+    // ---------- เช็คจาก temp ก่อน ----------
+    if (seenHN.has(hn)) {
+      exists = true;
+    } else {
+      // ---------- เช็คจาก Redis ----------
+      exists = await redis.sIsMember("etl:hn_codes", hn);
+      if (exists) seenHN.add(hn);
+    }
+
+    const merged = exists
+      ? mergePhones(await redis.hGetAll(`etl:phones:${hn}`), newPhones)
+      : mergePhones(null, newPhones);
+
+    if (!exists) {
+      inserts.push({ row, merged });
+      seenHN.add(hn); // สำคัญมาก! ป้องกัน insert ซ้ำภายใน batch
+    } else {
+      updates.push({ row, merged });
+    }
+
+    redisHSetOps.push({ key: `etl:phones:${hn}`, value: merged });
+  }
+
+  // ---------- Bulk INSERT ----------
+  if (inserts.length) {
+    // await bulkInsertPostgres(inserts);
+    const hnToAdd = inserts.map(({ row }) => row.hn_code);
+    await redis.sAdd("etl:hn_codes", hnToAdd);
+  }
+
+  // ---------- Bulk UPDATE ----------
+  if (updates.length) {
+    // await bulkUpdatePostgres(updates);
+  }
+
+  // ---------- Redis Pipeline ----------
+  const pipeline = redis.multi();
+  for (const { key, value } of redisHSetOps) {
+    pipeline.hSet(key, objectToHSet(value));
+  }
+  await pipeline.exec();
+
+  return { insertCount: inserts.length, updateCount: updates.length };
 }
