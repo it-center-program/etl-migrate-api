@@ -140,11 +140,16 @@ export async function runETL(req, res) {
 
     // total
     const totalDuration = Date.now() - startTime;
+    console.log("totalDuration_ms", totalDuration);
+    console.log("insertCount", saveRes.insertCount);
+    console.log("updateCount", saveRes.updateCount);
     res.json({
       message: "Batch completed",
       batch_no: batchNo,
       count: recordCount,
       lastId: newLastId,
+      insertCount: saveRes.insertCount,
+      updateCount: saveRes.updateCount,
       totalDuration_ms: totalDuration,
       stepDurations,
     });
