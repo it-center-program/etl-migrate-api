@@ -180,7 +180,10 @@ export async function saveToPostgresBulk(rows) {
   const currentPhones = new Map(Object.entries(phoneData)); // hn -> oldPhones object
 
   const inserts = [];
+  const temp_inserts = [];
   const updates = [];
+  let c_inserts = 0;
+  let c_updates = 0;
   const redisHSetOps = [];
 
   for (const row of rows) {
@@ -196,40 +199,52 @@ export async function saveToPostgresBulk(rows) {
     // - ถ้า hn ใหม่และยังไม่เคยเจอในรอบนี้ -> oldPhones = null
     let oldPhones = null;
     if (existsInRedis) {
-      oldPhones = currentPhones.get(hn) || null;
+      oldPhones = (await currentPhones.get(hn)) || null;
     } else if (seenAsNew) {
-      oldPhones = currentPhones.get(hn) || null;
+      oldPhones = (await currentPhones.get(hn)) || null;
     } else {
       oldPhones = null;
     }
     // merge ใช้ฟังก์ชันที่คุณมี (ปรับให้ถูกต้องตามก่อนหน้า)
-    const merged = mergePhones(oldPhones, phones);
-    if (hn == "N073935") {
-      console.log("---------------------------");
-      console.log(hn, merged);
-      console.log("---------------------------");
-    }
+    const merged = await mergePhones(oldPhones, phones);
+    // if (hn == "N073935") {
+    //   console.log("---------------------------");
+    //   console.log(hn, merged);
+    //   console.log("---------------------------");
+    // }
 
     // หลัง merge ให้อัปเดต currentPhones เสมอ เพื่อให้ subsequent rows ใช้ค่าอัปเดตล่าสุด
     currentPhones.set(hn, merged);
 
     // ตัดสิน insert / update:
     if (!existsInRedis && !seenAsNew) {
+      c_inserts++;
       // first time seen in this batch and not in redis => insert
-      inserts.push({ row, merged });
+      // inserts.push({ row, merged });
+      temp_inserts[hn] = { row, merged };
       tempHNs.add(hn); // mark as seen new
+    } else if (seenAsNew && !existsInRedis) {
+      c_updates++;
+      // first time seen in this batch and existed in redis => insert
+      temp_inserts[hn] = { row, merged };
     } else {
+      c_updates++;
       // either existed in redis originally OR we've already seen it in this batch
       updates.push({ row, merged });
     }
 
     redisHSetOps.push({ key: `etl:phones:${hn}`, value: merged });
   }
-
+  for (const key in temp_inserts) {
+    // console.log("row_insert " + key, temp_inserts[key]);
+    const { row, merged } = temp_inserts[key];
+    inserts.push({ row, merged });
+  }
+  // console.log(inserts);
   // -------------------------
   // 4) bulk insert/update (simulated here with redis.sAdd for test)
   // -------------------------
-  if (inserts.length) {
+  if (c_inserts) {
     await bulkInsertPostgres(inserts);
     await redis.sAdd(
       "etl:hn_codes",
@@ -237,7 +252,7 @@ export async function saveToPostgresBulk(rows) {
     );
   }
 
-  if (updates.length) {
+  if (c_updates) {
     await bulkUpdatePostgres(updates);
   }
 
@@ -254,8 +269,8 @@ export async function saveToPostgresBulk(rows) {
   }
 
   return {
-    insertCount: inserts.length,
-    updateCount: updates.length,
+    insertCount: c_inserts,
+    updateCount: c_updates,
   };
 }
 
