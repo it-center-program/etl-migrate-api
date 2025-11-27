@@ -5,33 +5,58 @@ import { redis } from "../database/redisClient.js";
 export async function preloadRedisFromPostgres() {
   console.log("🔄 Preloading Redis from PostgreSQL ...");
 
-  const total = await query("SELECT COUNT(*) AS c FROM etl_customer_crm").then(
-    (r) => Number(r.rows[0].c)
-  );
+  // ------------------------------------------------------
+  // STEP 1: Clear Redis keys (etl:hn_codes + etl:phones:*)
+  // ------------------------------------------------------
 
-  if (total === 0) {
-    console.log("⚠ ไม่มีข้อมูลใน Postgres");
-    return { total: 0 };
-  }
+  console.log("🧹 Clearing Redis old data...");
+
+  // ลบชุดหลัก
+  await redis.del("etl:hn_codes");
+
+  // ลบ etl:phones:* แบบ SCAN (ไม่ block Redis)
+  let cursor = "0";
+  do {
+    const [newCursor, keys] = await redis.scan(cursor, {
+      MATCH: "etl:phones:*",
+      COUNT: 1000,
+    });
+    cursor = newCursor;
+
+    if (keys.length > 0) {
+      await redis.del(keys);
+    }
+  } while (cursor !== "0");
+
+  console.log("✔ Redis cleared");
+
+  // ------------------------------------------------------
+  // STEP 2: Load data from Postgres → Redis (batch)
+  // ------------------------------------------------------
 
   const batch = 5000;
-  let offset = 0;
+  let lastId = 0;
   let loaded = 0;
 
-  while (offset < total) {
+  while (true) {
     const rows = await query(
-      `SELECT hn_code, tel_no, tel_no2, tel_no3, tel_no4, tel_no5,
+      `SELECT id, hn_code, tel_no, tel_no2, tel_no3, tel_no4, tel_no5,
               tel_no6, tel_no7, tel_no8, tel_no9, tel_no10, note_other
        FROM etl_customer_crm
+       WHERE id > $1
        ORDER BY id
-       LIMIT $1 OFFSET $2`,
-      [batch, offset]
+       LIMIT $2`,
+      [lastId, batch]
     ).then((r) => r.rows);
 
-    for (const r of rows) {
-      await redis.sAdd("etl:hn_codes", r.hn_code);
+    if (rows.length === 0) break;
 
-      await redis.hSet(`etl:phones:${r.hn_code}`, {
+    const pipeline = redis.multi();
+
+    for (const r of rows) {
+      pipeline.sAdd("etl:hn_codes", r.hn_code);
+
+      pipeline.hSet(`etl:phones:${r.hn_code}`, {
         tel_no: r.tel_no || "",
         tel_no2: r.tel_no2 || "",
         tel_no3: r.tel_no3 || "",
@@ -44,12 +69,15 @@ export async function preloadRedisFromPostgres() {
         tel_no10: r.tel_no10 || "",
         note_other: r.note_other || "",
       });
+
+      lastId = r.id;
     }
 
-    loaded += rows.length;
-    offset += batch;
+    await pipeline.exec();
 
-    console.log(`Loaded ${loaded}/${total} records into Redis...`);
+    loaded += rows.length;
+
+    console.log(`Loaded ${loaded} records...`);
   }
 
   console.log("✅ Redis preload complete");
